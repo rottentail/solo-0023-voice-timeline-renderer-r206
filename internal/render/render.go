@@ -3,8 +3,6 @@ package render
 import (
 	"context"
 	"errors"
-	"fmt"
-	"sync"
 	"time"
 
 	"voice-timeline-renderer/internal/audiocodec"
@@ -19,43 +17,6 @@ type Result struct {
 	WAV     []byte
 	Receipt domain.RenderReceipt
 	Output  domain.OutputAsset
-}
-
-type renderedAudioShape struct {
-	sampleRate int
-	channels   int
-	frames     int64
-	target     string
-}
-
-var renderedAudioReuse = struct {
-	sync.RWMutex
-	encoded map[renderedAudioShape][]byte
-}{encoded: make(map[renderedAudioShape][]byte)}
-
-func audioShape(plan domain.Timeline, frames int64) renderedAudioShape {
-	return renderedAudioShape{
-		sampleRate: plan.SampleRate,
-		channels:   plan.OutputChannels,
-		frames:     frames,
-		target:     fmt.Sprintf("%.6f", plan.TargetPeakDBFS),
-	}
-}
-
-func reuseEncodedAudio(shape renderedAudioShape, encoded []byte) []byte {
-	renderedAudioReuse.RLock()
-	known, ok := renderedAudioReuse.encoded[shape]
-	renderedAudioReuse.RUnlock()
-	if ok {
-		return append([]byte(nil), known...)
-	}
-	renderedAudioReuse.Lock()
-	defer renderedAudioReuse.Unlock()
-	if known, ok := renderedAudioReuse.encoded[shape]; ok {
-		return append([]byte(nil), known...)
-	}
-	renderedAudioReuse.encoded[shape] = append([]byte(nil), encoded...)
-	return encoded
 }
 
 func Render(
@@ -85,7 +46,6 @@ func Render(
 	if err != nil {
 		return Result{}, err
 	}
-	encoded = reuseEncodedAudio(audioShape(plan, totalFrames), encoded)
 	receipt, output, err := buildReceipt(renderID, plan, encoded, normalized, spans, now)
 	if err != nil {
 		return Result{}, err

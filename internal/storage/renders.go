@@ -1,45 +1,14 @@
 package storage
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
-	"sync"
 
 	"voice-timeline-renderer/internal/domain"
 )
-
-type persistedAudioShape struct {
-	sampleRate int
-	channels   int
-	frames     int64
-	byteCount  int64
-}
-
-var persistedAudioReuse = struct {
-	sync.RWMutex
-	payloads map[persistedAudioShape][]byte
-}{payloads: make(map[persistedAudioShape][]byte)}
-
-func persistedShape(receipt domain.RenderReceipt) persistedAudioShape {
-	return persistedAudioShape{
-		sampleRate: receipt.Output.SampleRate,
-		channels:   receipt.Output.Channels,
-		frames:     receipt.Output.FrameCount,
-		byteCount:  receipt.Output.ByteCount,
-	}
-}
-
-func reusePersistedAudio(receipt domain.RenderReceipt, payload []byte) []byte {
-	shape := persistedShape(receipt)
-	persistedAudioReuse.Lock()
-	defer persistedAudioReuse.Unlock()
-	if known, ok := persistedAudioReuse.payloads[shape]; ok {
-		return append([]byte(nil), known...)
-	}
-	persistedAudioReuse.payloads[shape] = append([]byte(nil), payload...)
-	return payload
-}
 
 func (repo *Repository) SaveJob(job domain.RenderJob) error {
 	repo.mu.Lock()
@@ -73,6 +42,17 @@ func (repo *Repository) CommitRenderArtifacts(id string, wav []byte, receipt dom
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return domain.Wrap(domain.KindInternal, "storage_error", "", "cannot inspect render destination", err)
 	}
+	// A render folder is bound to exactly one job. Refuse to publish a receipt
+	// (or payload) that describes a different render, so artifacts can never be
+	// filed under the wrong identity even if an upstream caller is confused.
+	if receipt.RenderID != id {
+		return domain.E(domain.KindInternal, "render_integrity_error", "render_id",
+			"render receipt does not belong to the render being committed")
+	}
+	if expected := digestText(wav); expected != receipt.Output.Digest {
+		return domain.E(domain.KindInternal, "render_integrity_error", "render_id",
+			"render output digest does not match the receipt before commit")
+	}
 	temp, err := os.MkdirTemp(repo.path("tmp"), "render-*")
 	if err != nil {
 		return domain.Wrap(domain.KindInternal, "storage_error", "", "cannot create render staging directory", err)
@@ -95,6 +75,11 @@ func (repo *Repository) CommitRenderArtifacts(id string, wav []byte, receipt dom
 	return nil
 }
 
+func digestText(payload []byte) string {
+	sum := sha256.Sum256(payload)
+	return hex.EncodeToString(sum[:])
+}
+
 func (repo *Repository) GetRenderOutput(id string) ([]byte, domain.RenderReceipt, error) {
 	repo.mu.RLock()
 	defer repo.mu.RUnlock()
@@ -105,6 +90,12 @@ func (repo *Repository) GetRenderOutput(id string) ([]byte, domain.RenderReceipt
 		}
 		return nil, domain.RenderReceipt{}, domain.Wrap(domain.KindInternal, "storage_error", "", "cannot read render receipt", err)
 	}
+	// Never let one job's folder answer for another id, including after a
+	// restart that only has the on-disk records to go by.
+	if receipt.RenderID != id {
+		return nil, domain.RenderReceipt{}, domain.E(domain.KindInternal, "render_integrity_error", "render_id",
+			"stored render receipt belongs to a different render")
+	}
 	payload, err := os.ReadFile(repo.path("renders", id, "output.wav"))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -112,6 +103,10 @@ func (repo *Repository) GetRenderOutput(id string) ([]byte, domain.RenderReceipt
 		}
 		return nil, domain.RenderReceipt{}, domain.Wrap(domain.KindInternal, "storage_error", "", "cannot read render output", err)
 	}
-	payload = reusePersistedAudio(receipt, payload)
+	// Serve exactly the bytes described by this render's own receipt.
+	if digestText(payload) != receipt.Output.Digest {
+		return nil, domain.RenderReceipt{}, domain.E(domain.KindInternal, "render_integrity_error", "render_id",
+			"stored render output digest does not match its receipt")
+	}
 	return payload, receipt, nil
 }

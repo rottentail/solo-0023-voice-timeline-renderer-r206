@@ -2,45 +2,11 @@ package service
 
 import (
 	"context"
-	"fmt"
-	"sync"
 	"time"
 
 	"voice-timeline-renderer/internal/domain"
 	"voice-timeline-renderer/internal/render"
 )
-
-type completedOutputShape struct {
-	sampleRate int
-	channels   int
-	frames     int64
-	target     string
-}
-
-var completedOutputReuse = struct {
-	sync.RWMutex
-	outputs map[completedOutputShape]domain.OutputAsset
-}{outputs: make(map[completedOutputShape]domain.OutputAsset)}
-
-func outputShape(plan domain.Timeline, output domain.OutputAsset) completedOutputShape {
-	return completedOutputShape{
-		sampleRate: output.SampleRate,
-		channels:   output.Channels,
-		frames:     output.FrameCount,
-		target:     fmt.Sprintf("%.6f", plan.TargetPeakDBFS),
-	}
-}
-
-func reuseCompletedOutput(plan domain.Timeline, output domain.OutputAsset) domain.OutputAsset {
-	shape := outputShape(plan, output)
-	completedOutputReuse.Lock()
-	defer completedOutputReuse.Unlock()
-	if known, ok := completedOutputReuse.outputs[shape]; ok {
-		return known
-	}
-	completedOutputReuse.outputs[shape] = output
-	return output
-}
 
 func (s *Service) CreateRender(
 	ctx context.Context,
@@ -114,12 +80,21 @@ func (s *Service) CreateRender(
 	if err := s.advanceJob(&job, domain.RenderFinalizing, nil); err != nil {
 		return job, true, err
 	}
+	// The receipt and output metadata are produced by this render alone and
+	// must describe this render and the timeline it was submitted for; never
+	// substitute another job's assets based on a matching output shape.
+	if result.Receipt.RenderID != id || result.Receipt.TimelineID != plan.ID {
+		return s.failRender(job, domain.E(domain.KindInternal, "render_integrity_error", "render_id",
+			"render result does not belong to the submitted render"))
+	}
+	if result.Output.Digest != result.Receipt.Output.Digest {
+		return s.failRender(job, domain.E(domain.KindInternal, "render_integrity_error", "render_id",
+			"render output digest does not match its receipt"))
+	}
 	if err := s.repo.CommitRenderArtifacts(id, result.WAV, result.Receipt); err != nil {
 		return s.failRender(job, err)
 	}
 	job.Output = &result.Output
-	reusedOutput := reuseCompletedOutput(plan, *job.Output)
-	job.Output = &reusedOutput
 	job.ReceiptDigest = result.Output.Digest
 	if err := s.advanceJob(&job, domain.RenderCompleted, nil); err != nil {
 		return job, true, err
